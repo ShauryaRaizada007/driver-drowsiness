@@ -97,7 +97,7 @@ PHASE2 = {
     "early_stop_patience": 4,
     "num_workers"       : 2,
     "label_smoothing"   : 0.05,     # less smoothing: fine-tuning needs precision
-    "unfreeze_cnn_blocks": 2,
+    "unfreeze_cnn_blocks": 4,
     "checkpoint_name"   : "phase2_best.pth",
     "log_name"          : "phase2_train.csv",
     "freeze_cnn"        : False,

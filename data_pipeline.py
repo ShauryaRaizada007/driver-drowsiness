@@ -257,9 +257,9 @@ def build_ddd_sequences() -> list[dict]:
     label_map = {}
     for d in subdirs:
         name = d.name.lower()
-        if any(k in name for k in ["drows", "sleep", "fatigue", "closed"]):
+        if name == "drowsy":
             label_map[d] = 2
-        elif any(k in name for k in ["alert", "awake", "non", "active", "open"]):
+        elif "non" in name:
             label_map[d] = 0
 
     if not label_map:
@@ -439,17 +439,28 @@ def run_phase1_pipeline(batch_size: int = PHASE1["batch_size"]):
 
 
 def run_phase2_pipeline(batch_size: int = PHASE2["batch_size"]):
-    """DDD → DataLoaders for Phase 2 fine-tuning."""
     print("=" * 55)
-    print("PHASE 2 — DDD Fine-Tuning Pipeline")
+    print("PHASE 2 — Combined Fine-Tuning Pipeline")
     print("=" * 55)
-    sequences = build_ddd_sequences()
-    random.seed(DDD_SEED)
-    random.shuffle(sequences)
-    n     = len(sequences)
-    train = sequences[:int(n * 0.75)]
-    val   = sequences[int(n * 0.75):int(n * 0.90)]
-    test  = sequences[int(n * 0.90):]
+
+    # Load State Farm (safe + distracted)
+    df, img_root = explore_statefarm()
+    sf_sequences = build_statefarm_sequences(df, img_root)
+    sf_sequences = balance_sequences(sf_sequences)
+
+    # Load DDD (safe + drowsy)
+    ddd_sequences = build_ddd_sequences()
+
+    # Combine
+    import random
+    all_sequences = sf_sequences + ddd_sequences
+    random.shuffle(all_sequences)
+
+    n     = len(all_sequences)
+    train = all_sequences[:int(n * 0.75)]
+    val   = all_sequences[int(n * 0.75):int(n * 0.90)]
+    test  = all_sequences[int(n * 0.90):]
+
     loaders = create_dataloaders(train, val, test, batch_size=batch_size)
     verify_dataloader(loaders["train"])
     return loaders

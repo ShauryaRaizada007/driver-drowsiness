@@ -1,17 +1,18 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║   Driver Drowsiness & Distraction Detection                  ║
-║   MODEL — CNN (MobileNetV2) + LSTM                           ║
+║   MODEL — CNN (MobileNetV2) + LSTM + Temporal Attention      ║
 ╚══════════════════════════════════════════════════════════════╝
 
 ARCHITECTURE:
     Input  (B, T, 3, 224, 224)
-    → Reshape     (B*T, 3, 224, 224)
-    → MobileNetV2 (B*T, 1280)
-    → Projection  (B*T, 512)
-    → Reshape     (B, T, 512)
-    → LSTM        (B, 512)   last hidden state
-    → FC          (B, 3)     logits
+    → Reshape          (B*T, 3, 224, 224)
+    → MobileNetV2      (B*T, 1280)
+    → Projection       (B*T, 512)
+    → Reshape          (B, T, 512)
+    → LSTM             (B, T, 512)   all timesteps
+    → TemporalAttention(B, 512)      weighted sum over timesteps
+    → FC               (B, 3)        logits
 
 USAGE:
     python model.py     ← runs forward pass smoke test
@@ -43,14 +44,14 @@ class MobileNetV2Extractor(nn.Module):
 
     Freezing strategy:
         Phase 1 → freeze ALL layers (only LSTM + FC train)
-        Phase 2 → unfreeze last 2 InvertedResidual blocks
+        Phase 2 → unfreeze last 4 InvertedResidual blocks
     """
 
     def __init__(self, freeze: bool = True):
         super().__init__()
-        backbone       = models.mobilenet_v2(weights=MobileNet_V2_Weights.IMAGENET1K_V1)
-        self.features  = backbone.features
-        self.pool      = nn.AdaptiveAvgPool2d(1)
+        backbone        = models.mobilenet_v2(weights=MobileNet_V2_Weights.IMAGENET1K_V1)
+        self.features   = backbone.features
+        self.pool       = nn.AdaptiveAvgPool2d(1)
         self.output_dim = CNN_OUTPUT_DIM   # 1280
 
         if freeze:
@@ -60,7 +61,7 @@ class MobileNetV2Extractor(nn.Module):
         for param in self.features.parameters():
             param.requires_grad = False
 
-    def unfreeze_last_n_blocks(self, n: int = 2):
+    def unfreeze_last_n_blocks(self, n: int = 4):
         """Unfreeze the last n feature layers for fine-tuning."""
         self.freeze_backbone()
         for layer in list(self.features.children())[-n:]:
@@ -81,20 +82,45 @@ class MobileNetV2Extractor(nn.Module):
 
 
 # ──────────────────────────────────────────────
-# SECTION 2 — Full CNN + LSTM Model
+# SECTION 2 — Temporal Attention
+# ──────────────────────────────────────────────
+
+class TemporalAttention(nn.Module):
+    """
+    Soft attention over LSTM timesteps.
+    Instead of only using the last hidden state, this learns
+    which frames in the sequence are most important.
+
+    Input : (B, T, hidden_size)
+    Output: (B, hidden_size)  — weighted sum over T
+    """
+
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.attn = nn.Linear(hidden_size, 1)
+
+    def forward(self, lstm_out: torch.Tensor) -> torch.Tensor:
+        # lstm_out: (B, T, hidden)
+        weights = torch.softmax(self.attn(lstm_out), dim=1)  # (B, T, 1)
+        return (weights * lstm_out).sum(dim=1)               # (B, hidden)
+
+
+# ──────────────────────────────────────────────
+# SECTION 3 — Full CNN + LSTM + Attention Model
 # ──────────────────────────────────────────────
 
 class DriverBehaviorModel(nn.Module):
     """
-    Full CNN + LSTM model for driver behavior classification.
+    Full CNN + LSTM + Temporal Attention model for driver behavior classification.
 
     Forward pass:
-        1. Flatten time into batch dim     (B*T, C, H, W)
-        2. CNN extracts spatial features   (B*T, 1280)
-        3. Project features down           (B*T, 512)
-        4. Restore time axis               (B, T, 512)
-        5. LSTM over sequence              (B, hidden)  ← last hidden state
-        6. Dropout + FC → logits           (B, num_classes)
+        1. Flatten time into batch dim      (B*T, C, H, W)
+        2. CNN extracts spatial features    (B*T, 1280)
+        3. Project features down            (B*T, 512)
+        4. Restore time axis                (B, T, 512)
+        5. LSTM over sequence               (B, T, hidden)  ← all timesteps
+        6. Temporal attention               (B, hidden)     ← weighted sum
+        7. Dropout + FC → logits            (B, num_classes)
     """
 
     def __init__(
@@ -113,7 +139,7 @@ class DriverBehaviorModel(nn.Module):
         # CNN backbone
         self.cnn = MobileNetV2Extractor(freeze=freeze_cnn)
 
-        # Project 1280 → 512 before LSTM (fewer LSTM params, faster convergence)
+        # Project 1280 → 512 before LSTM
         self.feature_proj = nn.Sequential(
             nn.Linear(CNN_OUTPUT_DIM, PROJECTION_DIM),
             nn.ReLU(inplace=True),
@@ -129,6 +155,9 @@ class DriverBehaviorModel(nn.Module):
             dropout      = lstm_dropout if num_layers > 1 else 0.0,
             bidirectional= False,
         )
+
+        # Temporal attention over all LSTM timesteps
+        self.attention = TemporalAttention(hidden_size)
 
         # Classifier head
         self.classifier = nn.Sequential(
@@ -170,12 +199,13 @@ class DriverBehaviorModel(nn.Module):
         features = self.feature_proj(features)      # (B*T, 512)
         features = features.view(B, T, -1)          # (B, T, 512)
 
-        # LSTM: returns hidden state at every timestep
-        _, (h_n, _) = self.lstm(features)           # h_n: (num_layers, B, hidden)
+        # LSTM over full sequence
+        lstm_out, _ = self.lstm(features)           # (B, T, hidden)
 
-        # Take top layer's final hidden state
-        last_hidden = h_n[-1]                       # (B, hidden)
-        return self.classifier(last_hidden)         # (B, num_classes)
+        # Temporal attention — focus on most important frames
+        context = self.attention(lstm_out)          # (B, hidden)
+
+        return self.classifier(context)             # (B, num_classes)
 
     def get_sequence_predictions(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -187,7 +217,7 @@ class DriverBehaviorModel(nn.Module):
         B, T, C, H, W = x.shape
         with torch.no_grad():
             features = self.cnn(x.view(B * T, C, H, W))
-        features  = self.feature_proj(features).view(B, T, -1)
+        features    = self.feature_proj(features).view(B, T, -1)
         lstm_out, _ = self.lstm(features)           # (B, T, hidden)
         return self.classifier(lstm_out)            # (B, T, num_classes)
 
@@ -201,7 +231,7 @@ class DriverBehaviorModel(nn.Module):
 
 
 # ──────────────────────────────────────────────
-# SECTION 3 — Loss Function
+# SECTION 4 — Loss Function
 # ──────────────────────────────────────────────
 
 def get_loss_fn(
@@ -219,7 +249,7 @@ def get_loss_fn(
 
 
 # ──────────────────────────────────────────────
-# SECTION 4 — Model Factory
+# SECTION 5 — Model Factory
 # ──────────────────────────────────────────────
 
 def build_model(
@@ -231,7 +261,7 @@ def build_model(
     Builds the model for a given training phase.
 
     phase="pretrain"  → CNN frozen, ~1.3M trainable params
-    phase="finetune"  → loads Phase 1 weights, unfreezes last 2 CNN blocks
+    phase="finetune"  → loads Phase 1 weights, unfreezes last 4 CNN blocks
     """
     model = DriverBehaviorModel(freeze_cnn=(phase == "pretrain"))
 
